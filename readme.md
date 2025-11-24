@@ -306,7 +306,7 @@ Example:
 |-------|--------|
 | optimized | -Ofast -w |
 | debug | -Ofast |
-| raw | -O0 |
+| raw | -O1 |
 
 Output binary: `program`
 
@@ -326,5 +326,7 @@ A is a:
 - Optional debug mode
 
 Its entire runtime maps directly onto raw C.
+
+There are also limits like max vars: 512, max lines: 4096, maximum dict space: 512 and tons more which is a shame!
 This was completley done with AI (Gemini to be exact) over 2-3 days with 1-2hrs a day so if you find any errors in the code it's not me, I really don't know how to code in C.
 please do add changes and fixes to my code and check out [Gemini](https://aistudio.google.com/)!
