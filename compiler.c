@@ -455,7 +455,7 @@ int main(int argc, char** argv) {
     }
 
     char cmd[2048];
-    if (is_raw) snprintf(cmd, 2048, "gcc -O0 out.c -o program -lm");
+    if (is_raw) snprintf(cmd, 2048, "gcc -O1 out.c -o program -lm");
     else if (strcmp(m, "debug") == 0) snprintf(cmd, 2048, "gcc -Ofast out.c -o program -lm && ./program");
     else snprintf(cmd, 2048, "gcc -Ofast -w out.c -o program -lm");
 
