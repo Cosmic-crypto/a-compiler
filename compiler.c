@@ -29,8 +29,8 @@ typedef struct {
 int SCOPE_DEPTH = 0; 
 int IN_USER_FUNC = 0; 
 int indent_stack[MAX_DEPTH];
-int scope_lines[MAX_DEPTH]; // New: Tracks line numbers of open blocks
-int func_start_line = 0;    // New: Tracks line number of current function
+int scope_lines[MAX_DEPTH]; 
+int func_start_line = 0;    
 
 Symbol symbol_table[MAX_VARS];
 int symbol_count = 0;
@@ -296,22 +296,52 @@ int compile_to_c(const char* filename, int auto_close, int verbose) {
 
         // Blocks
         if (strncmp(scratch, "for", 3) == 0) {
-            char v[32], s[32], e[32];
-            char* eq = strchr(scratch, '=');
-            char* to = strstr(scratch, " to ");
+            char v[32], s[32], e[32], step[32];
+            strcpy(step, "1"); // Default step
+            
             char* col = strchr(scratch, ':'); if(col)*col=0;
-            if(eq && to) {
-                *eq=0; *to=0;
-                strcpy(v, trim(scratch+3)); strcpy(s, trim(eq+1)); strcpy(e, trim(to+4));
-                sb_printf(current, "    for(int %s=%s; %s<=%s; %s++){\n", v,s,v,e,v);
+            char* eq = strchr(scratch, '=');
+            
+            // Check for specific syntax patterns
+            char* to_step_ptr = strstr(scratch, " to("); 
+            char* to_ptr = strstr(scratch, " to ");
+
+            if (eq && (to_step_ptr || to_ptr)) {
+                *eq = 0;
+                strcpy(v, trim(scratch+3)); // Variable name
                 
-                // Track Scope Line
+                if (to_step_ptr) {
+                    // CASE: for i = 0 to(2) 10
+                    *to_step_ptr = 0;
+                    strcpy(s, trim(eq+1)); // Start value
+                    
+                    char* step_start = to_step_ptr + 4; // Skip " to("
+                    char* close_paren = strchr(step_start, ')');
+                    
+                    if (close_paren) {
+                        *close_paren = 0;
+                        strcpy(step, trim(step_start)); // Step Value
+                        strcpy(e, trim(close_paren + 1)); // End Value
+                    }
+                } else {
+                    // CASE: for i = 0 to 10
+                    *to_ptr = 0;
+                    strcpy(s, trim(eq+1));
+                    strcpy(e, trim(to_ptr + 4));
+                }
+
+                // Generate C Loop with dynamic direction check
+                sb_printf(current, "    for(int %s=%s; ((%s) >= 0 ? %s<=%s : %s>=%s); %s+=(%s)){\n", 
+                    v, s, step, v, e, v, e, v, step);
+                
+                // Track Scope
                 indent_stack[SCOPE_DEPTH] = current_indent;
                 scope_lines[SCOPE_DEPTH] = line_num; 
                 SCOPE_DEPTH++;
             }
             line = strtok(NULL, "\n"); continue;
         }
+
         if (strncmp(scratch, "if", 2) == 0 || strncmp(scratch, "while", 5) == 0) {
             char* key = (scratch[0]=='i') ? "if" : "while";
             int off = (scratch[0]=='i') ? 2 : 5;
