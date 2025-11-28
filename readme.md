@@ -332,7 +332,7 @@ A is a:
 - Lightweight transpiler to C
 - Super-fast same/similar performance to C
 - Optional strict/raw mode  
-- Optional debug mode
+- Optional debug modes (raw, strict, optimized)
 
 Its entire runtime maps directly onto raw C.
 
