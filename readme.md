@@ -121,6 +121,15 @@ Compiles to:
 for (int i = A; i <= B; i++) {
 ```
 
+### For loops with a step
+```a
+for i = A to(C) B:
+```
+
+Compiles to:
+```C
+for (int i = A; i <= B; i+=C) {
+```
 ---
 
 # 5. Functions
