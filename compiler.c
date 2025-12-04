@@ -1,10 +1,10 @@
 /*
- * A Language Compiler v1.3
+ * A Language Compiler v2.4
  * Compiles A (.a files) to C, then to executable
  * 
  * Modes:
  *   optimized  - auto-closes blocks, 'end' optional (default)
- *   raw        - requires 'end' for all blocks
+ *   raw        - requires 'end' or '}' for all blocks
  *   debug      - optimized + machine-readable logging + auto-run
  *   debug_opt  - optimized + human-readable logging + auto-run
  *   debug_raw  - raw + human-readable logging + auto-run
@@ -20,7 +20,7 @@
 #define MAX_LINE 4096
 #define MAX_VARS 1024
 #define MAX_BLOCKS 256
-#define MAX_FUNCS 256
+#define MAX_FUNCS 512
 #define MAX_ERRORS 256
 
 /* ============== Types ============== */
@@ -46,6 +46,7 @@ typedef enum {
     TYPE_STRING,
     TYPE_LIST,
     TYPE_DICT,
+    TYPE_TUPLE,
     TYPE_UNKNOWN
 } VarType;
 
@@ -60,6 +61,7 @@ typedef struct {
     int line_num;
     char type[32];
     bool closed_by_end;
+    bool uses_braces;
 } Block;
 
 typedef struct {
@@ -110,6 +112,7 @@ static const char* type_to_string(VarType t) {
         case TYPE_STRING: return "string";
         case TYPE_LIST: return "list";
         case TYPE_DICT: return "dict";
+        case TYPE_TUPLE: return "tuple";
         default: return "unknown";
     }
 }
@@ -130,32 +133,31 @@ static void log_var_decl(const char* name, VarType type, bool is_const, const ch
     }
 }
 
-static void log_block_open(const char* type, const char* condition) {
+static void log_block_open(const char* type, const char* condition, bool uses_braces) {
     if (g_log_mode == LOG_HUMAN) {
-        fprintf(stderr, "\033[32m[BLOCK OPEN]\033[0m Line %d: Opening '%s' block",
-                g_current_line, type);
+        fprintf(stderr, "\033[32m[BLOCK OPEN]\033[0m Line %d: Opening '%s' block%s",
+                g_current_line, type, uses_braces ? " with {}" : "");
         if (condition && strlen(condition) > 0) {
             fprintf(stderr, " with condition: %s", condition);
         }
         fprintf(stderr, " (depth: %d)\n", g_block_depth);
     } else if (g_log_mode == LOG_MACHINE) {
-        fprintf(stderr, "BLOCK_OPEN:%d:%s:%d:%s\n", 
+        fprintf(stderr, "BLOCK_OPEN:%d:%s:%d:%s:%s\n", 
                 g_current_line, type, g_block_depth,
+                uses_braces ? "braces" : "indent",
                 condition ? condition : "none");
     }
 }
 
-static void log_block_close(const char* type, bool by_end, int orig_line) {
+static void log_block_close(const char* type, bool by_end, int orig_line, bool by_brace) {
     if (g_log_mode == LOG_HUMAN) {
+        const char* method = by_brace ? "via '}'" : (by_end ? "via 'end' keyword" : "via auto-close");
         fprintf(stderr, "\033[33m[BLOCK CLOSE]\033[0m Line %d: Closing '%s' block (opened at line %d) %s (depth: %d)\n",
-                g_current_line, type, orig_line,
-                by_end ? "via 'end' keyword" : "via auto-close",
-                g_block_depth - 1);
+                g_current_line, type, orig_line, method, g_block_depth - 1);
     } else if (g_log_mode == LOG_MACHINE) {
+        const char* method = by_brace ? "brace" : (by_end ? "explicit" : "auto");
         fprintf(stderr, "BLOCK_CLOSE:%d:%s:%d:%s:%d\n", 
-                g_current_line, type, g_block_depth - 1,
-                by_end ? "explicit" : "auto",
-                orig_line);
+                g_current_line, type, g_block_depth - 1, method, orig_line);
     }
 }
 
@@ -222,6 +224,15 @@ static void log_emit(const char* code) {
             else fputc(*p, stderr);
         }
         fprintf(stderr, "\n");
+    }
+}
+
+static void log_for_in(const char* var, const char* iterable, VarType type) {
+    if (g_log_mode == LOG_HUMAN) {
+        fprintf(stderr, "\033[32m[FOR-IN]\033[0m Line %d: Iterating '%s' over %s '%s'\n",
+                g_current_line, var, type_to_string(type), iterable);
+    } else if (g_log_mode == LOG_MACHINE) {
+        fprintf(stderr, "FOR_IN:%d:%s:%s:%s\n", g_current_line, var, iterable, type_to_string(type));
     }
 }
 
@@ -353,6 +364,32 @@ static bool is_empty_or_comment(const char* line) {
     return (*p == '\0' || *p == '#');
 }
 
+static bool ends_with_brace(const char* line) {
+    const char* p = line + strlen(line) - 1;
+    while (p >= line && isspace((unsigned char)*p)) p--;
+    return (p >= line && *p == '{');
+}
+
+static bool is_closing_brace(const char* line) {
+    const char* p = trim_left((char*)line);
+    return (*p == '}' && (*(p+1) == '\0' || isspace((unsigned char)*(p+1)) || *(p+1) == '#'));
+}
+
+static char* strip_trailing_brace(char* line) {
+    char* p = line + strlen(line) - 1;
+    while (p >= line && isspace((unsigned char)*p)) p--;
+    if (p >= line && *p == '{') {
+        *p = '\0';
+        // Also remove trailing whitespace before the brace
+        p--;
+        while (p >= line && isspace((unsigned char)*p)) {
+            *p = '\0';
+            p--;
+        }
+    }
+    return line;
+}
+
 static void append_output(const char* str) {
     int len = strlen(str);
     if (g_output_len + len < (int)sizeof(g_output) - 1) {
@@ -432,6 +469,9 @@ static VarType infer_expr_type(const char* expr) {
     
     if (e[0] == '"') return TYPE_STRING;
     if (strcmp(e, "true") == 0 || strcmp(e, "false") == 0) return TYPE_BOOL;
+    if (e[0] == '(' && strchr(e, ',')) return TYPE_TUPLE;
+    if (e[0] == '[') return TYPE_LIST;
+    if (e[0] == '{') return TYPE_DICT;
     
     if (strchr(e, '.') && !strchr(e, '"')) {
         bool is_num = true;
@@ -468,6 +508,7 @@ static VarType infer_expr_type(const char* expr) {
         sscanf(e, "%[^[]", base);
         VarType bt = get_var_type(trim(base));
         if (bt == TYPE_LIST) return TYPE_INT;
+        if (bt == TYPE_STRING) return TYPE_INT; // char as int
     }
     
     return TYPE_INT;
@@ -475,23 +516,24 @@ static VarType infer_expr_type(const char* expr) {
 
 /* ============== Block Management ============== */
 
-static void push_block(int indent, const char* type, const char* condition) {
+static void push_block(int indent, const char* type, const char* condition, bool uses_braces) {
     if (g_block_depth < MAX_BLOCKS) {
         g_blocks[g_block_depth].indent = indent;
         g_blocks[g_block_depth].line_num = g_current_line;
         strncpy(g_blocks[g_block_depth].type, type, 31);
         g_blocks[g_block_depth].closed_by_end = false;
+        g_blocks[g_block_depth].uses_braces = uses_braces;
         g_block_depth++;
-        log_block_open(type, condition);
+        log_block_open(type, condition, uses_braces);
     } else {
         error("Maximum block nesting depth exceeded");
     }
 }
 
-static void close_block(bool by_end) {
+static void close_block(bool by_end, bool by_brace) {
     if (g_block_depth > 0) {
         log_block_close(g_blocks[g_block_depth - 1].type, by_end, 
-                        g_blocks[g_block_depth - 1].line_num);
+                        g_blocks[g_block_depth - 1].line_num, by_brace);
         if (strcmp(g_blocks[g_block_depth - 1].type, "func") == 0) {
             g_in_function = false;
         }
@@ -500,19 +542,31 @@ static void close_block(bool by_end) {
     }
 }
 
+static void close_brace_block(void) {
+    if (g_block_depth > 0) {
+        if (!g_blocks[g_block_depth - 1].uses_braces) {
+            warning("Closing '}' for block not opened with '{'");
+        }
+        close_block(false, true);
+    } else {
+        error("'}' without matching '{'");
+    }
+}
+
 static void auto_close_blocks_to_indent(int new_indent) {
     while (g_block_depth > 0 && 
            g_blocks[g_block_depth - 1].indent >= new_indent &&
-           !g_blocks[g_block_depth - 1].closed_by_end) {
+           !g_blocks[g_block_depth - 1].closed_by_end &&
+           !g_blocks[g_block_depth - 1].uses_braces) {
         
         if (strcmp(g_blocks[g_block_depth - 1].type, "func") == 0) {
             if (new_indent <= g_blocks[g_block_depth - 1].indent) {
-                close_block(false);
+                close_block(false, false);
             }
             break;
         }
         
-        close_block(false);
+        close_block(false, false);
     }
 }
 
@@ -580,6 +634,10 @@ static void handle_variable_decl(char* line, bool is_const) {
         strcpy(type_str, "Dict");
         vt = TYPE_DICT;
         p += 5;
+    } else if (starts_with(p, "tuple ")) {
+        strcpy(type_str, "Tuple");
+        vt = TYPE_TUPLE;
+        p += 6;
     } else {
         error("Unknown type in variable declaration");
         return;
@@ -623,6 +681,7 @@ static void handle_variable_decl(char* line, bool is_const) {
         else if (vt == TYPE_STRING) def_val = "NULL";
         else if (vt == TYPE_LIST) def_val = "new_list()";
         else if (vt == TYPE_DICT) def_val = "new_dict()";
+        else if (vt == TYPE_TUPLE) def_val = "new_tuple()";
         
         strcpy(value, def_val);
         
@@ -683,7 +742,10 @@ static void handle_print(char* line) {
             snprintf(emit_buf, sizeof(emit_buf), "printf(\"%%f\\n\", %s);\n", expr);
             break;
         case TYPE_LIST:
-            snprintf(emit_buf, sizeof(emit_buf), "printf(\"[List]\\n\");\n");
+            snprintf(emit_buf, sizeof(emit_buf), "print_list(&%s);\n", expr);
+            break;
+        case TYPE_TUPLE:
+            snprintf(emit_buf, sizeof(emit_buf), "print_tuple(&%s);\n", expr);
             break;
         default:
             snprintf(emit_buf, sizeof(emit_buf), "printf(\"%%d\\n\", (int)(%s));\n", expr);
@@ -693,15 +755,17 @@ static void handle_print(char* line) {
     emit_no_log(emit_buf);
 }
 
-static void handle_if(char* line) {
+static void handle_if(char* line, bool has_brace) {
     char* p = trim_left(line);
     p += 2;
     p = trim_left(p);
     
+    if (has_brace) {
+        strip_trailing_brace(p);
+    }
+    
     char* colon = strrchr(p, ':');
-    if (!colon) {
-        error("Missing ':' after if condition");
-    } else {
+    if (colon) {
         *colon = '\0';
     }
     
@@ -720,10 +784,10 @@ static void handle_if(char* line) {
     snprintf(emit_buf, sizeof(emit_buf), "if (%s) {\n", p);
     emit_no_log(emit_buf);
     
-    push_block(get_indent(line), "if", condition);
+    push_block(get_indent(line), "if", condition, has_brace);
 }
 
-static void handle_elif(char* line) {
+static void handle_elif(char* line, bool has_brace) {
     if (g_block_depth == 0 || 
         (strcmp(g_blocks[g_block_depth - 1].type, "if") != 0 &&
          strcmp(g_blocks[g_block_depth - 1].type, "elif") != 0)) {
@@ -734,10 +798,12 @@ static void handle_elif(char* line) {
     p += 4;
     p = trim_left(p);
     
+    if (has_brace) {
+        strip_trailing_brace(p);
+    }
+    
     char* colon = strrchr(p, ':');
-    if (!colon) {
-        error("Missing ':' after elif condition");
-    } else {
+    if (colon) {
         *colon = '\0';
     }
     
@@ -765,10 +831,11 @@ static void handle_elif(char* line) {
     
     if (g_block_depth > 0) {
         strcpy(g_blocks[g_block_depth - 1].type, "elif");
+        g_blocks[g_block_depth - 1].uses_braces = has_brace;
     }
 }
 
-static void handle_else(char* line) {
+static void handle_else(char* line, bool has_brace) {
     (void)line;
     
     if (g_block_depth == 0 || 
@@ -788,18 +855,21 @@ static void handle_else(char* line) {
     
     if (g_block_depth > 0) {
         strcpy(g_blocks[g_block_depth - 1].type, "else");
+        g_blocks[g_block_depth - 1].uses_braces = has_brace;
     }
 }
 
-static void handle_while(char* line) {
+static void handle_while(char* line, bool has_brace) {
     char* p = trim_left(line);
     p += 5;
     p = trim_left(p);
     
+    if (has_brace) {
+        strip_trailing_brace(p);
+    }
+    
     char* colon = strrchr(p, ':');
-    if (!colon) {
-        error("Missing ':' after while condition");
-    } else {
+    if (colon) {
         *colon = '\0';
     }
     
@@ -818,18 +888,148 @@ static void handle_while(char* line) {
     snprintf(emit_buf, sizeof(emit_buf), "while (%s) {\n", p);
     emit_no_log(emit_buf);
     
-    push_block(get_indent(line), "while", condition);
+    push_block(get_indent(line), "while", condition, has_brace);
 }
 
-static void handle_for(char* line) {
+/* Handle for-in iteration: for var in iterable: */
+static void handle_for_in(char* line, bool has_brace) {
+    char* p = trim_left(line);
+    p += 3;  // skip "for"
+    p = trim_left(p);
+    
+    // Extract variable name
+    char var[64] = {0};
+    int i = 0;
+    while (*p && (isalnum(*p) || *p == '_')) {
+        if (i < 63) var[i++] = *p;
+        p++;
+    }
+    var[i] = '\0';
+    
+    if (strlen(var) == 0) {
+        error("Missing loop variable in for-in statement");
+        strcpy(var, "_item");
+    }
+    
+    // Skip " in "
+    p = trim_left(p);
+    if (strncmp(p, "in", 2) == 0) {
+        p += 2;
+        p = trim_left(p);
+    } else {
+        error("Missing 'in' keyword in for-in statement");
+    }
+    
+    // Get iterable (until : or { or end of string)
+    char iterable[256] = {0};
+    i = 0;
+    while (*p && *p != ':' && *p != '{' && !isspace(*p)) {
+        if (i < 255) iterable[i++] = *p;
+        p++;
+    }
+    iterable[i] = '\0';
+    trim(iterable);
+    
+    if (strlen(iterable) == 0) {
+        error("Missing iterable in for-in statement");
+        strcpy(iterable, "\"\"");
+    }
+    
+    // Determine iterable type
+    VarType iter_type = infer_expr_type(iterable);
+    
+    // For string literals, override type detection
+    if (iterable[0] == '"') {
+        iter_type = TYPE_STRING;
+    }
+    
+    log_for_in(var, iterable, iter_type);
+    
+    char emit_buf[MAX_LINE * 2];
+    char idx_var[80];
+    snprintf(idx_var, sizeof(idx_var), "_%s_idx", var);
+    
+    switch (iter_type) {
+        case TYPE_STRING:
+            // Iterate over characters in string
+            snprintf(emit_buf, sizeof(emit_buf),
+                "{ char* _%s_str = %s;\n"
+                "for (int %s = 0; _%s_str[%s]; %s++) {\n"
+                "    char %s = _%s_str[%s];\n",
+                var, iterable,
+                idx_var, var, idx_var, idx_var,
+                var, var, idx_var);
+            register_var(var, TYPE_INT, false);  // char as int
+            break;
+            
+        case TYPE_LIST:
+            // Iterate over list elements
+            snprintf(emit_buf, sizeof(emit_buf),
+                "for (int %s = 0; %s < %s.size; %s++) {\n"
+                "    int %s = %s.data[%s];\n",
+                idx_var, idx_var, iterable, idx_var,
+                var, iterable, idx_var);
+            register_var(var, TYPE_INT, false);
+            break;
+            
+        case TYPE_DICT:
+            // Iterate over dict keys
+            snprintf(emit_buf, sizeof(emit_buf),
+                "for (int %s = 0; %s < %s.size; %s++) {\n"
+                "    char* %s = %s.keys[%s];\n",
+                idx_var, idx_var, iterable, idx_var,
+                var, iterable, idx_var);
+            register_var(var, TYPE_STRING, false);
+            break;
+            
+        case TYPE_TUPLE:
+            // Iterate over tuple elements
+            snprintf(emit_buf, sizeof(emit_buf),
+                "for (int %s = 0; %s < %s.size; %s++) {\n"
+                "    int %s = %s.data[%s];\n",
+                idx_var, idx_var, iterable, idx_var,
+                var, iterable, idx_var);
+            register_var(var, TYPE_INT, false);
+            break;
+            
+        default:
+            // Assume string-like for unknown types
+            snprintf(emit_buf, sizeof(emit_buf),
+                "{ char* _%s_str = (char*)(%s);\n"
+                "for (int %s = 0; _%s_str && _%s_str[%s]; %s++) {\n"
+                "    char %s = _%s_str[%s];\n",
+                var, iterable,
+                idx_var, var, var, idx_var, idx_var,
+                var, var, idx_var);
+            register_var(var, TYPE_INT, false);
+            break;
+    }
+    
+    emit_no_log(emit_buf);
+    
+    char condition[MAX_LINE];
+    snprintf(condition, sizeof(condition), "%s in %s", var, iterable);
+    push_block(get_indent(line), "for_in", condition, has_brace);
+}
+
+static void handle_for(char* line, bool has_brace) {
     char* p = trim_left(line);
     p += 3;
     p = trim_left(p);
     
+    // Check if this is a for-in loop
+    char* in_keyword = strstr(p, " in ");
+    if (in_keyword) {
+        handle_for_in(line, has_brace);
+        return;
+    }
+    
+    if (has_brace) {
+        strip_trailing_brace(p);
+    }
+    
     char* colon = strrchr(p, ':');
-    if (!colon) {
-        error("Missing ':' after for loop declaration");
-    } else {
+    if (colon) {
         *colon = '\0';
     }
     
@@ -926,18 +1126,20 @@ static void handle_for(char* line) {
     emit_no_log(emit_buf);
     
     register_var(var, TYPE_INT, false);
-    push_block(get_indent(line), "for", condition);
+    push_block(get_indent(line), "for", condition, has_brace);
 }
 
-static void handle_func(char* line) {
+static void handle_func(char* line, bool has_brace) {
     char* p = trim_left(line);
     p += 4;
     p = trim_left(p);
     
+    if (has_brace) {
+        strip_trailing_brace(p);
+    }
+    
     char* colon = strchr(p, ':');
-    if (!colon) {
-        error("Missing ':' after function declaration");
-    } else {
+    if (colon) {
         *colon = '\0';
     }
     
@@ -982,7 +1184,7 @@ static void handle_func(char* line) {
     g_in_function = true;
     g_func_indent = get_indent(line);
     
-    push_block(g_func_indent, "func", name);
+    push_block(g_func_indent, "func", name, has_brace);
 }
 
 static void handle_append(char* line) {
@@ -1042,7 +1244,15 @@ static void handle_append(char* line) {
 
 static void handle_end(void) {
     if (g_block_depth > 0) {
-        close_block(true);
+        if (g_blocks[g_block_depth - 1].uses_braces) {
+            warning("Using 'end' to close block opened with '{' - use '}' instead");
+        }
+        close_block(true, false);
+        
+        // Close extra scope for for_in string iteration
+        if (g_block_depth >= 0 && strcmp(g_blocks[g_block_depth].type, "for_in") == 0) {
+            emit_no_log("}\n");
+        }
     } else {
         error("'end' without matching block");
     }
@@ -1129,10 +1339,19 @@ static void process_line(char* original_line) {
     
     log_parse_line(trim(trimmed), indent);
     
+    // Handle closing brace
+    if (is_closing_brace(trimmed)) {
+        close_brace_block();
+        return;
+    }
+    
     if (strcmp(trim(trimmed), "end") == 0) {
         handle_end();
         return;
     }
+    
+    // Check if line ends with opening brace
+    bool has_brace = ends_with_brace(trimmed);
     
     if (!is_raw_mode() && g_block_depth > 0) {
         if (!starts_with(trimmed, "elif") && !starts_with(trimmed, "else")) {
@@ -1147,29 +1366,31 @@ static void process_line(char* original_line) {
     }
     else if (starts_with(t, "int ") || starts_with(t, "float ") || 
              starts_with(t, "bool ") || starts_with(t, "string ") ||
-             starts_with(t, "list ") || starts_with(t, "dict ")) {
+             starts_with(t, "list ") || starts_with(t, "dict ") ||
+             starts_with(t, "tuple ")) {
         handle_variable_decl(t, false);
     }
     else if (starts_with(t, "print(")) {
         handle_print(t);
     }
     else if (starts_with(t, "if ")) {
-        handle_if(original_line);
+        handle_if(original_line, has_brace);
     }
     else if (starts_with(t, "elif ")) {
-        handle_elif(t);
+        handle_elif(t, has_brace);
     }
-    else if (starts_with(t, "else:") || strcmp(trim(t), "else") == 0) {
-        handle_else(t);
+    else if (starts_with(t, "else:") || starts_with(t, "else {") || 
+             starts_with(t, "else:") || strcmp(trim(t), "else") == 0) {
+        handle_else(t, has_brace);
     }
     else if (starts_with(t, "while ")) {
-        handle_while(original_line);
+        handle_while(original_line, has_brace);
     }
     else if (starts_with(t, "for ")) {
-        handle_for(original_line);
+        handle_for(original_line, has_brace);
     }
     else if (starts_with(t, "func ")) {
-        handle_func(original_line);
+        handle_func(original_line, has_brace);
     }
     else if (starts_with(t, "append(")) {
         handle_append(t);
@@ -1229,6 +1450,15 @@ static const char* STDLIB =
 "    return l->size;\n"
 "}\n"
 "\n"
+"static void print_list(List* l) {\n"
+"    printf(\"[\");\n"
+"    for (int i = 0; i < l->size; i++) {\n"
+"        printf(\"%d\", l->data[i]);\n"
+"        if (i < l->size - 1) printf(\", \");\n"
+"    }\n"
+"    printf(\"]\\n\");\n"
+"}\n"
+"\n"
 "static int* slice_arr(int* arr, int start, int end, int* out_len) {\n"
 "    *out_len = end - start;\n"
 "    int* result = (int*)malloc(sizeof(int) * (*out_len));\n"
@@ -1236,6 +1466,47 @@ static const char* STDLIB =
 "        result[i] = arr[start + i];\n"
 "    }\n"
 "    return result;\n"
+"}\n"
+"\n"
+"/* Tuple implementation */\n"
+"typedef struct {\n"
+"    int* data;\n"
+"    int size;\n"
+"} Tuple;\n"
+"\n"
+"static Tuple new_tuple(void) {\n"
+"    Tuple t;\n"
+"    t.size = 0;\n"
+"    t.data = NULL;\n"
+"    return t;\n"
+"}\n"
+"\n"
+"static Tuple make_tuple(int count, ...) {\n"
+"    Tuple t;\n"
+"    t.size = count;\n"
+"    t.data = (int*)malloc(sizeof(int) * count);\n"
+"    va_list args;\n"
+"    va_start(args, count);\n"
+"    for (int i = 0; i < count; i++) {\n"
+"        t.data[i] = va_arg(args, int);\n"
+"    }\n"
+"    va_end(args);\n"
+"    return t;\n"
+"}\n"
+"\n"
+"static void print_tuple(Tuple* t) {\n"
+"    printf(\"(\");\n"
+"    for (int i = 0; i < t->size; i++) {\n"
+"        printf(\"%d\", t->data[i]);\n"
+"        if (i < t->size - 1) printf(\", \");\n"
+"    }\n"
+"    printf(\")\\n\");\n"
+"}\n"
+"\n"
+"static void tuple_free(Tuple* t) {\n"
+"    free(t->data);\n"
+"    t->data = NULL;\n"
+"    t->size = 0;\n"
 "}\n"
 "\n"
 "/* Dictionary implementation */\n"
@@ -1317,16 +1588,17 @@ static void compile_file(const char* filename) {
     while (g_block_depth > 0) {
         g_current_line = g_blocks[g_block_depth - 1].line_num;
         
-        if (is_raw_mode()) {
+        if (is_raw_mode() || g_blocks[g_block_depth - 1].uses_braces) {
             char msg[512];
             snprintf(msg, sizeof(msg), 
-                     "Unclosed '%s' block started at line %d - missing 'end'",
+                     "Unclosed '%s' block started at line %d - missing '%s'",
                      g_blocks[g_block_depth - 1].type,
-                     g_blocks[g_block_depth - 1].line_num);
+                     g_blocks[g_block_depth - 1].line_num,
+                     g_blocks[g_block_depth - 1].uses_braces ? "}" : "end");
             error(msg);
         }
         
-        close_block(false);
+        close_block(false, false);
     }
     g_current_line = saved_line;
     
@@ -1432,14 +1704,17 @@ static const char* mode_to_string(CompileMode mode) {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("A Language Compiler v1.3\n");
+        printf("A Language Compiler v2.4\n");
         printf("Usage: %s <file.a> [mode]\n\n", argv[0]);
         printf("Modes:\n");
         printf("  optimized (default) - Auto-closes blocks, 'end' optional\n");
-        printf("  raw                 - Requires 'end' for all blocks\n");
+        printf("  raw                 - Requires 'end' or '}' for all blocks\n");
         printf("  debug               - Optimized + machine-readable logging + auto-run\n");
         printf("  debug_opt           - Optimized + human-readable logging + auto-run\n");
         printf("  debug_raw           - Raw + human-readable logging + auto-run\n");
+        printf("\nNew features:\n");
+        printf("  - Curly braces: 'if x > 0 {' ... '}'\n");
+        printf("  - For-in loops: 'for c in string:', 'for x in list:', 'for k in dict:'\n");
         return 1;
     }
     
@@ -1495,6 +1770,7 @@ int main(int argc, char* argv[]) {
     
     // Write C file
     const char* c_file = "output.c";
+    
     write_c_file(c_file);
     printf("Generated %s\n", c_file);
     
