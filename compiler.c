@@ -1412,6 +1412,7 @@ static const char* STDLIB =
 "#include <stdlib.h>\n"
 "#include <string.h>\n"
 "#include <stdbool.h>\n"
+"#include <stdarg.h>\n"
 "#include <math.h>\n"
 "#include <time.h>\n"
 "#include <setjmp.h>\n"
@@ -1770,7 +1771,6 @@ int main(int argc, char* argv[]) {
     
     // Write C file
     const char* c_file = "output.c";
-    
     write_c_file(c_file);
     printf("Generated %s\n", c_file);
     
